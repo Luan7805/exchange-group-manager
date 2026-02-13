@@ -6,8 +6,12 @@ This PowerShell script sets up a simple HTTP server that allows managing members
 
 ## Features
 - Handles "add" and "remove" actions for group members
-- Supports `Mail-enabled security groups` and `Distribution groups`
-- Returns results as plain text in the HTTP response
+- Supports `DistributionGroup` and `UnifiedGroup` types
+- Validates group existence before attempting operations
+- Validates group type (rejects dynamic groups and unsupported types)
+- Validates member email existence before processing
+- Returns structured JSON responses with appropriate HTTP status codes
+- Automatic connection and disconnection from Exchange Online
 
 ## Environment variables
   - `CLIENT_ID`: The Application ID of the registered app in Azure AD
@@ -35,14 +39,128 @@ curl -X POST http://localhost:8080/ \
 }'
 ```
 
-### Response
-- **200 OK**: Plain text with success messages for each member (one per line). Errors for individual members are included if they occur
-- **401 Unauthorized**: If the Authorization header is missing or incorrect
-- **405 Method Not Allowed**: For non-POST requests
-- **500 Internal Server Error**: For validation failures or connection issues
+## HTTP Response Codes
 
-Example success response:
+| Code | Description |
+|------|-------------|
+| **200** | Operation successful |
+| **400** | Bad request (missing parameters, invalid JSON) |
+| **401** | Unauthorized (invalid or missing token) |
+| **405** | Method not allowed (non-POST request) |
+| **422** | Validation error (group not found, unsupported type, recipient not found) |
+| **500** | Internal server error (connection failure, unexpected error) |
+
+## Response Examples
+
+### Success (200 OK)
+```json
+{
+  "success": true,
+  "results": [
+    {
+      "member": "user1@example.com",
+      "action": "add",
+      "status": "success",
+      "message": "Member added to distribution group successfully"
+    },
+    {
+      "member": "user2@example.com",
+      "action": "add",
+      "status": "success",
+      "message": "Member added to distribution group successfully"
+    }
+  ]
+}
 ```
-User user1@example.com added to Distribution group group@example.com successfully.
-User user2@example.com added to Distribution group group@example.com successfully.
+
+### Group Not Found (422 Unprocessable Entity)
+```json
+{
+  "success": false,
+  "error": "Group not found",
+  "group": "nonexistent@example.com"
+}
 ```
+
+### Unsupported Group Type (422 Unprocessable Entity)
+```json
+{
+  "success": false,
+  "error": "Unsupported group type",
+  "group": "dynamicgroup@example.com",
+  "type": "DynamicDistributionGroup"
+}
+```
+
+### Recipient Not Found (422 Unprocessable Entity)
+```json
+{
+  "success": false,
+  "error": "Recipient not found",
+  "email": "invalid@example.com"
+}
+```
+
+### Unauthorized (401 Unauthorized)
+```json
+{
+  "success": false,
+  "error": "Unauthorized: Invalid or missing authorization token"
+}
+```
+
+### Invalid Parameters (400 Bad Request)
+```json
+{
+  "success": false,
+  "error": "Incomplete parameters in JSON: action, members (array), and group are required"
+}
+```
+
+### Invalid Action (400 Bad Request)
+```json
+{
+  "success": false,
+  "error": "Invalid action: must be 'add' or 'remove'"
+}
+```
+
+### Connection Error (500 Internal Server Error)
+```json
+{
+  "success": false,
+  "error": "Failed to connect to Exchange Online: <error details>"
+}
+```
+
+## Validation Flow
+
+The server performs the following validations in order:
+
+1. **Parameter Validation** (before connecting to Exchange)
+   - Checks if `action`, `members`, and `group` are provided
+   - Validates `action` is either "add" or "remove"
+   - Validates `members` is a non-empty array
+
+2. **Exchange Connection**
+   - Connects to Exchange Online using certificate authentication
+   - Returns 500 error if connection fails
+
+3. **Group Validation** (requires Exchange connection)
+   - Checks if the group exists
+   - Returns 422 error if group not found
+
+4. **Group Type Validation**
+   - Verifies the group is either `DistributionGroup` or `UnifiedGroup`
+   - Returns 422 error if group type is not supported (e.g., dynamic groups)
+
+5. **Member Validation** (requires Exchange connection)
+   - Checks if each member email exists as a recipient
+   - Returns 422 error if any member is not found
+
+6. **Operation Processing**
+   - Adds or removes each member from the group
+   - Returns individual results for each member
+
+7. **Cleanup**
+   - Automatically disconnects from Exchange Online (always executed)

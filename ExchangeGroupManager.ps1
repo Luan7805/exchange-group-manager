@@ -1,19 +1,241 @@
 # --- Connection and Security ---------------------------------
-$CLIENT_ID    = $env:CLIENT_ID
+$CLIENT_ID = $env:CLIENT_ID
 $ORGANIZATION = $env:ORGANIZATION
-$CERT_PATH    = $env:CERT_PATH
-$API_TOKEN    = $env:API_TOKEN
+$CERT_PATH = $env:CERT_PATH
+$API_TOKEN = $env:API_TOKEN
 
 # Check if all required environment variables are set
 $missing = @()
-if (-not $CLIENT_ID)    { $missing += "CLIENT_ID" }
+if (-not $CLIENT_ID) { $missing += "CLIENT_ID" }
 if (-not $ORGANIZATION) { $missing += "ORGANIZATION" }
-if (-not $CERT_PATH)    { $missing += "CERT_PATH" }
-if (-not $API_TOKEN)    { $missing += "API_TOKEN" }
+if (-not $CERT_PATH) { $missing += "CERT_PATH" }
+if (-not $API_TOKEN) { $missing += "API_TOKEN" }
 
 if ($missing.Count -gt 0) {
     Write-Error "Missing environment variable(s): $($missing -join ', '). Please set them before running the script."
     exit 1
+}
+
+# --- Functions -----------------------------------------------
+
+function Send-JsonResponse {
+    param(
+        [System.Net.HttpListenerResponse]$Response,
+        [int]$StatusCode,
+        [hashtable]$Data
+    )
+    
+    $Response.StatusCode = $StatusCode
+    $Response.ContentType = "application/json; charset=utf-8"
+    
+    $json = $Data | ConvertTo-Json -Depth 10
+    $buffer = [System.Text.Encoding]::UTF8.GetBytes($json)
+    $Response.OutputStream.Write($buffer, 0, $buffer.Length)
+}
+
+function Test-GroupExists {
+    param(
+        [string]$GroupIdentity
+    )
+    
+    $result = @{
+        Exists = $false
+        Type   = $null
+        Object = $null
+    }
+    
+    # Try Distribution Group
+    $groupObj = Get-DistributionGroup -Identity $GroupIdentity -ErrorAction SilentlyContinue
+    if ($groupObj) {
+        $result.Exists = $true
+        $result.Type = "DistributionGroup"
+        $result.Object = $groupObj
+        return $result
+    }
+    
+    # Try Unified Group
+    $groupObj = Get-UnifiedGroup -Identity $GroupIdentity -ErrorAction SilentlyContinue
+    if ($groupObj) {
+        $result.Exists = $true
+        $result.Type = "UnifiedGroup"
+        $result.Object = $groupObj
+        return $result
+    }
+    
+    # Try Dynamic Distribution Group (not supported, but we need to detect it)
+    $groupObj = Get-DynamicDistributionGroup -Identity $GroupIdentity -ErrorAction SilentlyContinue
+    if ($groupObj) {
+        $result.Exists = $true
+        $result.Type = "DynamicDistributionGroup"
+        $result.Object = $groupObj
+        return $result
+    }
+    
+    return $result
+}
+
+function Test-RecipientExists {
+    param(
+        [string]$Email
+    )
+    
+    $recipient = Get-Recipient -Identity $Email -ErrorAction SilentlyContinue
+    return ($null -ne $recipient)
+}
+
+function Invoke-GroupMemberOperation {
+    param(
+        [string]$GroupType,
+        [string]$Action,
+        [string]$Group,
+        [string]$Member
+    )
+    
+    $result = @{
+        member  = $Member
+        action  = $Action
+        status  = "success"
+        message = ""
+    }
+    
+    try {
+        if ($GroupType -eq "DistributionGroup") {
+            if ($Action -eq "add") {
+                Add-DistributionGroupMember -Identity $Group -Member $Member -Confirm:$false -BypassSecurityGroupManagerCheck -ErrorAction Stop
+                $result.message = "Member added to distribution group successfully"
+            }
+            elseif ($Action -eq "remove") {
+                Remove-DistributionGroupMember -Identity $Group -Member $Member -Confirm:$false -BypassSecurityGroupManagerCheck -ErrorAction Stop
+                $result.message = "Member removed from distribution group successfully"
+            }
+        }
+        elseif ($GroupType -eq "UnifiedGroup") {
+            if ($Action -eq "add") {
+                Add-UnifiedGroupLinks -Identity $Group -LinkType "Members" -Links $Member -Confirm:$false -ErrorAction Stop
+                $result.message = "Member added to unified group successfully"
+            }
+            elseif ($Action -eq "remove") {
+                Remove-UnifiedGroupLinks -Identity $Group -LinkType "Members" -Links $Member -Confirm:$false -ErrorAction Stop
+                $result.message = "Member removed from unified group successfully"
+            }
+        }
+    }
+    catch {
+        $result.status = "error"
+        $result.message = $_.Exception.Message
+    }
+    
+    return $result
+}
+
+function Invoke-GroupRequest {
+    param(
+        [PSCustomObject]$Params,
+        [System.Net.HttpListenerResponse]$Response
+    )
+    
+    $action = $Params.action
+    $members = $Params.members
+    $group = $Params.group
+    
+    # Validate parameters (before connecting to Exchange)
+    if (-not $action -or -not $members -or -not $group) {
+        Send-JsonResponse -Response $Response -StatusCode 400 -Data @{
+            success = $false
+            error   = "Incomplete parameters in JSON: action, members (array), and group are required"
+        }
+        return
+    }
+    
+    if ($action -notin @("add", "remove")) {
+        Send-JsonResponse -Response $Response -StatusCode 400 -Data @{
+            success = $false
+            error   = "Invalid action: must be 'add' or 'remove'"
+        }
+        return
+    }
+    
+    if ($members -isnot [array] -or $members.Count -eq 0) {
+        Send-JsonResponse -Response $Response -StatusCode 400 -Data @{
+            success = $false
+            error   = "Members must be a non-empty array of strings"
+        }
+        return
+    }
+    
+    # Connect to Exchange Online BEFORE any validation that uses Exchange cmdlets
+    try {
+        Connect-ExchangeOnline -CertificateFilePath $CERT_PATH -AppID $CLIENT_ID -Organization $ORGANIZATION -ShowBanner:$false -ErrorAction Stop
+    }
+    catch {
+        Send-JsonResponse -Response $Response -StatusCode 500 -Data @{
+            success = $false
+            error   = "Failed to connect to Exchange Online: $($_.Exception.Message)"
+        }
+        return
+    }
+    
+    try {
+        # Validate group exists (requires Exchange connection)
+        $groupInfo = Test-GroupExists -GroupIdentity $group
+        
+        if (-not $groupInfo.Exists) {
+            Send-JsonResponse -Response $Response -StatusCode 422 -Data @{
+                success = $false
+                error   = "Group not found"
+                group   = $group
+            }
+            return
+        }
+        
+        # Validate group type is supported
+        if ($groupInfo.Type -notin @("DistributionGroup", "UnifiedGroup")) {
+            Send-JsonResponse -Response $Response -StatusCode 422 -Data @{
+                success = $false
+                error   = "Unsupported group type"
+                group   = $group
+                type    = $groupInfo.Type
+            }
+            return
+        }
+        
+        # Validate all members exist (requires Exchange connection)
+        foreach ($member in $members) {
+            if (-not (Test-RecipientExists -Email $member)) {
+                Send-JsonResponse -Response $Response -StatusCode 422 -Data @{
+                    success = $false
+                    error   = "Recipient not found"
+                    email   = $member
+                }
+                return
+            }
+        }
+        
+        # Process all members
+        $results = @()
+        foreach ($member in $members) {
+            $opResult = Invoke-GroupMemberOperation -GroupType $groupInfo.Type -Action $action -Group $group -Member $member
+            $results += $opResult
+        }
+        
+        # Send success response
+        Send-JsonResponse -Response $Response -StatusCode 200 -Data @{
+            success = $true
+            results = $results
+        }
+        
+    }
+    catch {
+        # Catch any unexpected errors
+        Send-JsonResponse -Response $Response -StatusCode 500 -Data @{
+            success = $false
+            error   = "Internal server error: $($_.Exception.Message)"
+        }
+    }
+    finally {
+        # Always disconnect
+        Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+    }
 }
 
 # --- Web Server ----------------------------------------------
@@ -32,12 +254,12 @@ try {
             # Check authorization header
             $authHeader = $request.Headers["Authorization"]
             if ($authHeader -ne $API_TOKEN) {
-                $response.StatusCode = 401
-                $response.ContentType = "text/plain"
-                $buffer = [System.Text.Encoding]::UTF8.GetBytes("Unauthorized: Invalid or missing authorization token.")
-                $response.OutputStream.Write($buffer, 0, $buffer.Length)
+                Send-JsonResponse -Response $response -StatusCode 401 -Data @{
+                    success = $false
+                    error   = "Unauthorized: Invalid or missing authorization token"
+                }
                 $response.OutputStream.Close()
-                continue  # Proceed to the next request
+                continue
             }
 
             # Read the POST request body
@@ -45,96 +267,29 @@ try {
             $body = $reader.ReadToEnd()
             $reader.Close()
 
-            # Assume the body is JSON with keys: action, members (array), group
             try {
                 $params = $body | ConvertFrom-Json
-                $action = $params.action
-                $members = $params.members
-                $group = $params.group
-
-                # Validate parameters
-                if (-not $action -or -not $members -or -not $group) {
-                    throw "Incomplete parameters in JSON: action, members (array), and group are required."
-                }
-                if ($action -notin @("add", "remove")) {
-                    throw "Invalid action: must be 'add' or 'remove'."
-                }
-                if ($members -isnot [array] -or $members.Count -eq 0) {
-                    throw "Members must be a non-empty array of strings."
-                }
-
-                # Connect to Exchange Online
-                Connect-ExchangeOnline -CertificateFilePath $CERT_PATH -AppID $CLIENT_ID -Organization $ORGANIZATION -ShowBanner:$false
-
-                # Try to get the group as Distribution Group
-                $groupObj = Get-DistributionGroup -Identity $group -ErrorAction SilentlyContinue
-
-                if ($groupObj) {
-                    $groupType = "DistributionGroup"
-                } else {
-                    # If not Distribution Group, try as Unified Group
-                    $groupObj = Get-UnifiedGroup -Identity $group -ErrorAction SilentlyContinue
-                    if ($groupObj) {
-                        $groupType = "UnifiedGroup"
-                    } else {
-                        throw "Group not found or unsupported: $group"
-                    }
-                }
-
-                # Collect results
-                $results = @()
-
-                foreach ($member in $members) {
-                    try {
-                        if ($groupType -eq "DistributionGroup") {
-                            if ($action -eq "add") {
-                                Add-DistributionGroupMember -Identity $group -Member $member -Confirm:$false -BypassSecurityGroupManagerCheck -ErrorAction Stop
-                                $results += "User $member added to Distribution group $group successfully."
-                            } elseif ($action -eq "remove") {
-                                Remove-DistributionGroupMember -Identity $group -Member $member -Confirm:$false -BypassSecurityGroupManagerCheck -ErrorAction Stop
-                                $results += "User $member removed from Distribution group $group successfully."
-                            }
-                        } elseif ($groupType -eq "UnifiedGroup") {
-                            if ($action -eq "add") {
-                                Add-UnifiedGroupLinks -Identity $group -LinkType "Members" -Links $member -Confirm:$false -ErrorAction Stop
-                                $results += "User $member added to Unified group $group successfully."
-                            } elseif ($action -eq "remove") {
-                                Remove-UnifiedGroupLinks -Identity $group -LinkType "Members" -Links $member -Confirm:$false -ErrorAction Stop
-                                $results += "User $member removed from Unified group $group successfully."
-                            }
-                        }
-                    } catch {
-                        $results += "Error processing ${member}: $_"
-                    }
-                }
-
-                # Disconnect
-                Disconnect-ExchangeOnline -Confirm:$false
-
-                # Send success response with all results
-                $result = $results -join "`n"
-                $response.StatusCode = 200
-                $response.ContentType = "text/plain"
-                $buffer = [System.Text.Encoding]::UTF8.GetBytes($result)
-                $response.OutputStream.Write($buffer, 0, $buffer.Length)
-            } catch {
-                # Send error response
-                $errorMsg = "Error: $_"
-                $response.StatusCode = 500
-                $response.ContentType = "text/plain"
-                $buffer = [System.Text.Encoding]::UTF8.GetBytes($errorMsg)
-                $response.OutputStream.Write($buffer, 0, $buffer.Length)
+                Invoke-GroupRequest -Params $params -Response $response
             }
-        } else {
+            catch {
+                Send-JsonResponse -Response $response -StatusCode 500 -Data @{
+                    success = $false
+                    error   = "Internal server error: $($_.Exception.Message)"
+                }
+            }
+        }
+        else {
             # Method not supported
-            $response.StatusCode = 405
-            $buffer = [System.Text.Encoding]::UTF8.GetBytes("Method not allowed. Use POST.")
-            $response.OutputStream.Write($buffer, 0, $buffer.Length)
+            Send-JsonResponse -Response $response -StatusCode 405 -Data @{
+                success = $false
+                error   = "Method not allowed. Use POST"
+            }
         }
 
         $response.OutputStream.Close()
     }
-} finally {
+}
+finally {
     $listener.Stop()
     Write-Host "Web server stopped." -ForegroundColor Yellow
 }
